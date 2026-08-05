@@ -1,0 +1,71 @@
+name: 1NCE daily SIM report
+
+# Runs at 11:00 Asia/Kolkata every day.
+#
+# GitHub Actions cron is ALWAYS interpreted as UTC and has no timezone
+# option, so 11:00 IST (UTC+5:30) must be written as 05:30 UTC. India does
+# not observe daylight saving, so this stays correct all year.
+#
+# Note: GitHub does not guarantee cron punctuality. Scheduled jobs are queued
+# on a best-effort basis and can be delayed by several minutes (sometimes
+# longer) when the hosted-runner pool is busy; the top of the hour is the
+# worst offender, which is another reason :30 is a good slot.
+on:
+  schedule:
+    - cron: "30 5 * * *"
+  workflow_dispatch: {}     # also lets you trigger a run by hand from the Actions tab
+
+concurrency:
+  # Per-SIM usage/quota fetching is concurrent but still takes a while for
+  # large fleets, so make sure a slow run never overlaps the next day's run.
+  group: onence-daily
+  cancel-in-progress: false
+
+permissions:
+  contents: read            # least privilege: the job only needs to check out code
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run 1NCE report and push to Zoho Analytics
+        env:
+          # --- 1NCE Management API client credentials ---
+          ONCE_USERNAME: ${{ secrets.ONCE_USERNAME }}
+          ONCE_PASSWORD: ${{ secrets.ONCE_PASSWORD }}
+
+          # --- Zoho Analytics READ credentials (need ZohoAnalytics.data.read) ---
+          # These are the *_ANALYTICS vars that read the "Zenduit Devices" and
+          # "Accounts" views (same trio the Monogoto/Telenor/FloLive scripts use).
+          ZOHO_CLIENT_ID_ANALYTICS: ${{ secrets.ZOHO_CLIENT_ID_ANALYTICS }}
+          ZOHO_CLIENT_SECRET_ANALYTICS: ${{ secrets.ZOHO_CLIENT_SECRET_ANALYTICS }}
+          ZOHO_CLIENT_REFRESH_TOKEN_ANALYTICS: ${{ secrets.ZOHO_CLIENT_REFRESH_TOKEN_ANALYTICS }}
+
+          # --- Zoho Analytics WRITE credentials (need ZohoAnalytics.data.create) ---
+          # Separate token: the read token above CANNOT write. These are the
+          # same *_UNI vars the Geotab ETL / Monogoto / Telenor / FloLive scripts
+          # write with.
+          ZOHO_CLIENT_ID_UNI: ${{ secrets.ZOHO_CLIENT_ID_UNI }}
+          ZOHO_CLIENT_SECRET_UNI: ${{ secrets.ZOHO_CLIENT_SECRET_UNI }}
+          ZOHO_REFRESH_TOKEN_UNI: ${{ secrets.ZOHO_REFRESH_TOKEN_UNI }}
+
+          ZOHO_ORG_ID: ${{ secrets.ZOHO_ORG_ID }}
+        # No output path needed and no artifact step: the script writes
+        # nothing to disk — Zoho Analytics is the only destination. If the
+        # upload fails the script exits non-zero, so this job turns RED
+        # rather than reporting a green run that produced nothing.
+        run: python main.py
