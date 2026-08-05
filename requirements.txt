@@ -1,0 +1,11 @@
+# Third-party packages actually imported by main.py.
+#
+# Deliberately NOT here:
+#   XlsxWriter  - the script has no Excel output; Zoho Analytics is the only
+#                 destination, so nothing is written to disk.
+
+aiohttp>=3.9          # async HTTP for the 1NCE Management API
+aiolimiter>=1.1        # AsyncLimiter — rate-limits per-SIM usage/quota calls
+tqdm>=4.66             # tqdm_asyncio — progress bar for concurrent usage fetches
+requests>=2.31         # synchronous calls to the Zoho Analytics REST API
+pandas>=2.0            # dataframes / merges / groupby
