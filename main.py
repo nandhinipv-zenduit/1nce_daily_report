@@ -78,6 +78,80 @@ PAGE_SIZE = 100
 MAX_RPS = 15
 CONCURRENT_REQUESTS = 15
 
+# Retry policy for 1NCE calls. Run #78 died with a single
+# "502 Bad Gateway" on /v1/sims?page=3 — a transient upstream blip that
+# should never take down a daily job. Every 1NCE request now goes through
+# _nce_request() below, which retries 429 / 5xx / connection errors /
+# timeouts with exponential backoff + jitter before giving up.
+NCE_MAX_ATTEMPTS = int(os.getenv("ONCE_MAX_ATTEMPTS", "6"))
+NCE_BACKOFF_BASE_SECONDS = 2.0     # 2, 4, 8, 16, 32 ... (capped below)
+NCE_BACKOFF_MAX_SECONDS = 60.0
+NCE_RETRY_STATUSES = {408, 429, 500, 502, 503, 504}
+
+
+def _basic_auth_header(username, password):
+    # aiohttp deprecated the `auth=BasicAuth(...)` parameter (removed in 4.0)
+    # in favour of sending the Authorization header yourself. Building it by
+    # hand keeps us independent of the aiohttp version on the runner.
+    import base64
+    raw = f"{username}:{password}".encode("utf-8")
+    return "Basic " + base64.b64encode(raw).decode("ascii")
+
+
+def _retry_delay(attempt, retry_after=None):
+    """Seconds to sleep before `attempt` (1-based) is retried."""
+    import random
+    if retry_after:
+        try:
+            return min(float(retry_after), NCE_BACKOFF_MAX_SECONDS)
+        except (TypeError, ValueError):
+            pass
+    delay = min(NCE_BACKOFF_BASE_SECONDS * (2 ** (attempt - 1)), NCE_BACKOFF_MAX_SECONDS)
+    return delay + random.uniform(0, delay * 0.25)
+
+
+async def _nce_request(session, method, url, *, max_attempts=None, label=None, **kwargs):
+    """
+    Perform one 1NCE HTTP request with retries.
+
+    Returns (status, json_or_None). Retries on retryable HTTP statuses
+    (NCE_RETRY_STATUSES), on aiohttp connection errors and on timeouts.
+    Non-retryable statuses (401, 403, 404 ...) are returned immediately
+    without raising so the caller decides what they mean. Only after the
+    last attempt still fails with a retryable error is the error raised.
+    """
+    max_attempts = max_attempts or NCE_MAX_ATTEMPTS
+    label = label or f"{method} {url}"
+    last_err = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            async with session.request(method, url, **kwargs) as r:
+                if r.status in NCE_RETRY_STATUSES:
+                    last_err = aiohttp.ClientResponseError(
+                        r.request_info, r.history, status=r.status,
+                        message=r.reason or "", headers=r.headers,
+                    )
+                    retry_after = r.headers.get("Retry-After")
+                else:
+                    if r.status == 204:
+                        return r.status, None
+                    try:
+                        return r.status, await r.json(content_type=None)
+                    except Exception:
+                        return r.status, None
+        except (aiohttp.ClientConnectionError, aiohttp.ClientPayloadError, asyncio.TimeoutError) as e:
+            last_err = e
+            retry_after = None
+
+        if attempt == max_attempts:
+            break
+        delay = _retry_delay(attempt, retry_after)
+        print(f"⚠️ 1NCE {label}: {type(last_err).__name__}: {last_err} — "
+              f"retry {attempt}/{max_attempts - 1} in {delay:.1f}s")
+        await asyncio.sleep(delay)
+
+    raise last_err
+
 
 # ==========================================================
 # SMALL SHARED HELPER (used by both Zoho Analytics column lookups below)
@@ -107,15 +181,20 @@ def _numeric_fillna(series, fill=0):
 # ==========================================================
 async def get_1nce_token():
     async with aiohttp.ClientSession() as session:
-        async with session.post(
+        status, data = await _nce_request(
+            session, "POST",
             f"{ONE_NCE['url']}/management-api/oauth/token",
+            label="oauth/token",
             data={"grant_type": "client_credentials"},
-            auth=aiohttp.BasicAuth(ONE_NCE["username"], ONE_NCE["password"]),
-            timeout=ClientTimeout(total=30)
-        ) as r:
-            r.raise_for_status()
-            data = await r.json()
-            return data["access_token"]
+            headers={"Authorization": _basic_auth_header(ONE_NCE["username"], ONE_NCE["password"])},
+            timeout=ClientTimeout(total=30),
+        )
+        if status != 200 or not isinstance(data, dict) or "access_token" not in data:
+            raise RuntimeError(
+                f"1NCE token request failed: HTTP {status} {data!r}. "
+                f"401/403 here means ONCE_USERNAME/ONCE_PASSWORD are wrong or rotated."
+            )
+        return data["access_token"]
 
 
 # ==========================================================
@@ -135,14 +214,22 @@ async def fetch_all_sims(token):
     rows = []
     async with aiohttp.ClientSession() as session:
         while True:
-            async with session.get(
+            # Retries transient 5xx/429/connection errors per page. If a page
+            # STILL fails after all attempts we let it raise: the Zoho table
+            # is replaced wholesale at the end, so a silently-partial
+            # inventory would be worse than a red run.
+            status, batch = await _nce_request(
+                session, "GET",
                 f"{ONE_NCE['url']}/management-api/v1/sims",
+                label=f"/v1/sims page={page}",
                 headers=headers,
                 params={"page": page, "pageSize": PAGE_SIZE},
-                timeout=ClientTimeout(total=30)
-            ) as r:
-                r.raise_for_status()
-                batch = await r.json()
+                timeout=ClientTimeout(total=30),
+            )
+            if status != 200:
+                raise RuntimeError(f"1NCE /v1/sims page={page} returned HTTP {status}: {batch!r}")
+            if not isinstance(batch, list):
+                raise RuntimeError(f"1NCE /v1/sims page={page} returned unexpected payload: {batch!r}")
             if not batch:
                 break
             rows.extend(batch)
@@ -195,14 +282,20 @@ async def fetch_sim_row(session, limiter, sem, token, iccid, day):
     headers = {"Authorization": f"Bearer {token}"}
 
     async def _get(url, params=None):
+        # Per-SIM calls are best-effort (a failure lands in Usage_Fetch_Error,
+        # not a crash), but they still get the same retry treatment so a
+        # transient 502 doesn't blank out a SIM's usage for the day.
         async with limiter, sem:
             try:
-                async with session.get(url, headers=headers, params=params) as r:
-                    if r.status != 200:
-                        return None, r.status
-                    return await r.json(), 200
-            except Exception:
-                return None, "exception"
+                status, payload = await _nce_request(
+                    session, "GET", url, headers=headers, params=params,
+                    label=url.split("/management-api")[-1],
+                )
+                if status != 200:
+                    return None, status
+                return payload, 200
+            except Exception as e:
+                return None, f"exception:{type(e).__name__}"
 
     usage_payload, usage_code = await _get(
         f"{ONE_NCE['url']}/management-api/v1/sims/{iccid}/usage",
